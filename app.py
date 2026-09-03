@@ -10,18 +10,47 @@ session_state and is cleared when the tab closes.
 
 import io
 import json
+import os
+import random
 import re
 import smtplib
 import ssl
 import time
 import uuid
+from datetime import datetime, timedelta
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
 st.set_page_config(page_title="Resume Mailer", page_icon="📧", layout="centered")
+
+# --------------------------------------------------------------------------
+# Sending window — emails only actually go out 9:00 AM–5:00 PM US Central,
+# handling CST/CDT automatically via zoneinfo. Outside that window, sends
+# are held rather than dispatched, and pick back up automatically once the
+# window reopens (whenever the app is next interacted with during that time).
+# --------------------------------------------------------------------------
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+SEND_WINDOW_START_HOUR = 9
+SEND_WINDOW_END_HOUR = 17  # 5:00 PM, exclusive
+
+
+def is_within_sending_window(now: datetime | None = None) -> bool:
+    now = now or datetime.now(CENTRAL_TZ)
+    return SEND_WINDOW_START_HOUR <= now.hour < SEND_WINDOW_END_HOUR
+
+
+def next_window_open_str(now: datetime | None = None) -> str:
+    now = now or datetime.now(CENTRAL_TZ)
+    if now.hour < SEND_WINDOW_START_HOUR:
+        target = now.replace(hour=SEND_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    else:
+        target = (now + timedelta(days=1)).replace(hour=SEND_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    return target.strftime("%A %I:%M %p CT")
+
 
 WORK_AUTH_OPTIONS = [
     "STEM OPT", "OPT (Post-Completion)", "H1B", "H1B Transfer", "Green Card",
@@ -114,30 +143,67 @@ def build_signature(profile: dict) -> str:
     return "\n".join(lines)
 
 
-def assemble_email(profile: dict, narrative: str, ai_subject: str, greeting_name: str) -> tuple[str, str]:
-    """Builds the final body (greeting + AI pitch + facts + closing + signature)
-    and a Unicode-bold subject. Shared by both the single and bulk send flows."""
+DEFAULT_EMAIL_TEMPLATE = """Dear {greeting_name},
+
+I hope this message finds you well. {narrative}
+
+Below are my details
+
+{facts_block}
+
+I have attached my updated resume for your review. I look forward to the opportunity to discuss how I can contribute to your team.
+
+Thank you for your consideration.
+
+Best Regards,
+{full_name}
+{signature}"""
+
+TEMPLATE_PLACEHOLDERS = ["{greeting_name}", "{narrative}", "{facts_block}", "{full_name}", "{signature}"]
+
+SUBJECT_STYLE_PRESETS = {
+    "AI subject + name (default)": "{ai_subject} - {full_name}",
+    "Interested in <role>": "Interested in {role_title} - {full_name}",
+    "Application for <role> role": "Application for {role_title} Role - {full_name}",
+    "Just role + name": "{role_title} - {full_name}",
+    "Custom...": None,  # user supplies their own template string
+}
+SUBJECT_PLACEHOLDERS = ["{ai_subject}", "{role_title}", "{full_name}", "{recruiter_company}"]
+
+
+def assemble_email(profile: dict, narrative: str, ai_subject: str, greeting_name: str,
+                    role_title: str = "", recruiter_company: str = "") -> tuple[str, str]:
+    """Builds the final body from the profile's custom template if it has one,
+    otherwise the default (greeting + AI pitch + facts + closing + signature).
+    Also returns a Unicode-bold subject, built from the profile's subject
+    template if it has one. Shared by the single and queue send flows."""
     facts_block = build_facts_block(profile)
     signature = build_signature(profile)
     full_name = profile.get("full_name", "")
+    greeting_name = greeting_name or "Hiring Team"
 
-    greeting = f"Dear {greeting_name or 'Hiring Team'},\n\nI hope this message finds you well. "
-    full_body = greeting + narrative
-    if facts_block:
-        full_body += f"\n\nBelow are my details\n\n{facts_block}"
-    full_body += (
-        "\n\nI have attached my updated resume for your review. I look forward to "
-        "the opportunity to discuss how I can contribute to your team."
-        "\n\nThank you for your consideration."
+    template = (profile.get("email_template") or "").strip() or DEFAULT_EMAIL_TEMPLATE
+    full_body = (
+        template
+        .replace("{greeting_name}", greeting_name)
+        .replace("{narrative}", narrative)
+        .replace("{facts_block}", facts_block)
+        .replace("{full_name}", full_name)
+        .replace("{signature}", signature)
     )
-    full_body += f"\n\nBest Regards,\n{full_name}"
-    if signature:
-        full_body += f"\n{signature}"
 
-    subject_text = (ai_subject or "").strip() or "Application"
-    if full_name:
-        subject_text = f"{subject_text} - {full_name}"
-    bold_subject = to_unicode_bold(subject_text)
+    ai_subject_clean = (ai_subject or "").strip() or "Application"
+    subject_template = (profile.get("subject_template") or "").strip() or "{ai_subject} - {full_name}"
+    subject_text = (
+        subject_template
+        .replace("{ai_subject}", ai_subject_clean)
+        .replace("{role_title}", role_title or "")
+        .replace("{full_name}", full_name)
+        .replace("{recruiter_company}", recruiter_company or "")
+    )
+    # tidy up if a placeholder resolved to empty (e.g. no role_title yet) leaving stray spaces/dashes
+    subject_text = re.sub(r"\s+", " ", subject_text).strip(" -")
+    bold_subject = to_unicode_bold(subject_text or ai_subject_clean)
 
     return full_body, bold_subject
 
@@ -169,7 +235,7 @@ applying for the role described below, using the candidate profile and resume ab
 Reference only real resume content — never invent skills, achievements, or numbers not in the resume.
 Wrap 3-5 genuinely essential keywords/skills in **double asterisks** for emphasis (e.g. **AWS**, **Python**).
 
-The email already opens with "Hello/Hi <Recruiter>,\\n\\nI hope this message finds you well. " before
+The email already opens with "Dear <Recruiter>,\\n\\nI hope this message finds you well. " before
 your text, so your FIRST sentence must continue naturally straight after "well." — start it with
 something like "I am writing to express my interest in the <role> position at <company>..." if a
 role/company name is identifiable in the job requirement below, otherwise phrase the opening
@@ -340,10 +406,10 @@ def send_email(smtp_server, smtp_port, sender_email, sender_password, use_tls,
 # them can connect remotely.
 
 DB_PROFILE_COLUMNS = [
-    "profile_id", "label", "full_name", "phone", "contact_email", "linkedin", "github",
+    "profile_id", "label", "is_active", "full_name", "phone", "contact_email", "linkedin", "github",
     "current_location", "work_authorization", "years_experience", "availability",
     "provider", "api_key", "smtp_server", "smtp_port", "sender_email", "sender_password",
-    "use_tls", "cc_self", "resume_filename", "resume_bytes",
+    "use_tls", "cc_self", "resume_filename", "resume_bytes", "email_template", "subject_template",
 ]
 
 LOG_COLUMNS = [
@@ -372,13 +438,15 @@ def ensure_tables(conn):
     IF OBJECT_ID('dbo.profiles', 'U') IS NULL
     CREATE TABLE dbo.profiles (
         profile_id NVARCHAR(64) PRIMARY KEY,
-        label NVARCHAR(200), full_name NVARCHAR(200), phone NVARCHAR(50),
+        label NVARCHAR(200), is_active BIT, full_name NVARCHAR(200), phone NVARCHAR(50),
         contact_email NVARCHAR(200), linkedin NVARCHAR(300), github NVARCHAR(300),
         current_location NVARCHAR(200), work_authorization NVARCHAR(100),
         years_experience NVARCHAR(50), availability NVARCHAR(100),
         provider NVARCHAR(50), api_key NVARCHAR(500), smtp_server NVARCHAR(200),
         smtp_port INT, sender_email NVARCHAR(200), sender_password NVARCHAR(500),
         use_tls BIT, cc_self BIT, resume_filename NVARCHAR(300), resume_bytes VARBINARY(MAX),
+        email_template NVARCHAR(MAX),
+        subject_template NVARCHAR(500),
         created_at DATETIME DEFAULT GETDATE(), updated_at DATETIME DEFAULT GETDATE()
     )
     """)
@@ -394,6 +462,20 @@ def ensure_tables(conn):
         job_description NVARCHAR(MAX), status NVARCHAR(20), error_message NVARCHAR(1000)
     )
     """)
+    # Migrations: adds columns to a dbo.profiles table created before these
+    # features existed. No-op on a freshly created table (columns already there).
+    cur.execute("""
+    IF COL_LENGTH('dbo.profiles', 'email_template') IS NULL
+    ALTER TABLE dbo.profiles ADD email_template NVARCHAR(MAX) NULL
+    """)
+    cur.execute("""
+    IF COL_LENGTH('dbo.profiles', 'subject_template') IS NULL
+    ALTER TABLE dbo.profiles ADD subject_template NVARCHAR(500) NULL
+    """)
+    cur.execute("""
+    IF COL_LENGTH('dbo.profiles', 'is_active') IS NULL
+    ALTER TABLE dbo.profiles ADD is_active BIT NOT NULL DEFAULT 1
+    """)
     conn.commit()
 
 
@@ -402,7 +484,7 @@ def save_profile_to_db(conn, pid: str, profile: dict):
     cur.execute("SELECT COUNT(*) FROM dbo.profiles WHERE profile_id = %s", (pid,))
     exists = cur.fetchone()[0] > 0
     vals = (
-        profile.get("label"), profile.get("full_name"), profile.get("phone"),
+        profile.get("label"), bool(profile.get("is_active", True)), profile.get("full_name"), profile.get("phone"),
         profile.get("contact_email"), profile.get("linkedin"), profile.get("github"),
         profile.get("current_location"), profile.get("work_authorization"),
         profile.get("years_experience"), profile.get("availability"),
@@ -410,24 +492,26 @@ def save_profile_to_db(conn, pid: str, profile: dict):
         int(profile.get("smtp_port") or 587), profile.get("sender_email"), profile.get("sender_password"),
         bool(profile.get("use_tls")), bool(profile.get("cc_self")),
         profile.get("resume_filename"), profile.get("resume_bytes"),
+        profile.get("email_template"), profile.get("subject_template"),
     )
     if exists:
         cur.execute("""
             UPDATE dbo.profiles SET
-                label=%s, full_name=%s, phone=%s, contact_email=%s, linkedin=%s, github=%s,
+                label=%s, is_active=%s, full_name=%s, phone=%s, contact_email=%s, linkedin=%s, github=%s,
                 current_location=%s, work_authorization=%s, years_experience=%s, availability=%s,
                 provider=%s, api_key=%s, smtp_server=%s, smtp_port=%s, sender_email=%s, sender_password=%s,
-                use_tls=%s, cc_self=%s, resume_filename=%s, resume_bytes=%s, updated_at=GETDATE()
+                use_tls=%s, cc_self=%s, resume_filename=%s, resume_bytes=%s,
+                email_template=%s, subject_template=%s, updated_at=GETDATE()
             WHERE profile_id=%s
         """, vals + (pid,))
     else:
         cur.execute("""
             INSERT INTO dbo.profiles
-                (profile_id, label, full_name, phone, contact_email, linkedin, github,
+                (profile_id, label, is_active, full_name, phone, contact_email, linkedin, github,
                  current_location, work_authorization, years_experience, availability,
                  provider, api_key, smtp_server, smtp_port, sender_email, sender_password,
-                 use_tls, cc_self, resume_filename, resume_bytes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 use_tls, cc_self, resume_filename, resume_bytes, email_template, subject_template)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (pid,) + vals)
     conn.commit()
 
@@ -445,6 +529,7 @@ def load_profiles_from_db(conn) -> dict:
         d["smtp_port"] = int(d.get("smtp_port") or 587)
         d["use_tls"] = bool(d.get("use_tls"))
         d["cc_self"] = bool(d.get("cc_self"))
+        d["is_active"] = bool(d.get("is_active", True)) if d.get("is_active") is not None else True
         loaded[pid] = d
     return loaded
 
@@ -482,14 +567,78 @@ def fetch_log(conn, today_only: bool, limit: int = 300):
     return [dict(zip(LOG_COLUMNS, row)) for row in rows]
 
 
+def has_already_sent(db: dict, profile_label: str, recruiter_email: str, role_title: str) -> bool:
+    """Checks dbo.email_log for a prior successful send from this profile to this
+    recruiter for this role — so the same person doesn't get emailed twice for the
+    same position, even across separate sessions. Only meaningful when a role_title
+    is known (otherwise there's no reliable way to say it's "the same position"),
+    and only when SQL Server is configured — fails open (allows sending) if the
+    check itself can't run, so a DB hiccup never silently blocks a legitimate send.
+    """
+    if not db.get("server") or not recruiter_email or not (role_title or "").strip():
+        return False
+    try:
+        conn = get_db_connection(db)
+        ensure_tables(conn)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM dbo.email_log
+            WHERE status = 'sent'
+              AND LOWER(LTRIM(RTRIM(profile_label))) = LOWER(LTRIM(RTRIM(%s)))
+              AND LOWER(LTRIM(RTRIM(recruiter_email))) = LOWER(LTRIM(RTRIM(%s)))
+              AND LOWER(LTRIM(RTRIM(role_title))) = LOWER(LTRIM(RTRIM(%s)))
+        """, (profile_label, recruiter_email, role_title))
+        count = cur.fetchone()[0]
+        conn.close()
+        return count > 0
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# Local DB-config cache — only useful when running the app on your own
+# machine (Streamlit Cloud's filesystem is ephemeral and wiped on redeploy,
+# and would be shared across every visitor, which we don't want). Saves you
+# re-typing the SQL Server connection fields every time you restart locally.
+# --------------------------------------------------------------------------
+DB_CONFIG_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".resume_mailer_db_config.json")
+
+
+def load_cached_db_config():
+    try:
+        with open(DB_CONFIG_CACHE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_cached_db_config(db: dict) -> bool:
+    try:
+        with open(DB_CONFIG_CACHE_PATH, "w") as f:
+            json.dump(db, f)
+        return True
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------
 # Session state
 # --------------------------------------------------------------------------
 st.session_state.setdefault("profiles", {})       # id -> profile dict
 st.session_state.setdefault("active_profile_id", None)
-st.session_state.setdefault("bulk_requirements", [])   # list of requirement text strings
-st.session_state.setdefault("bulk_queue", [])           # list of generated bulk-send items
+st.session_state.setdefault("bulk_requirements", [])   # list of requirement text strings, drained as processed
+st.session_state.setdefault("recruiter_cards", [])       # persistent copy-cards, newest first
 # Per-profile generated drafts are stored dynamically as gen_subject_<id> / gen_body_<id>
+
+
+def add_recruiter_card(company: str, recruiter_name: str, recruiter_email: str,
+                        recruiter_phone: str, role_title: str, source: str):
+    """Appends a copy-able card to the persistent Recruiter Details tab so
+    details aren't lost even if you don't copy them right when generated."""
+    st.session_state.recruiter_cards.insert(0, {
+        "company": company, "recruiter_name": recruiter_name, "recruiter_email": recruiter_email,
+        "recruiter_phone": recruiter_phone, "role_title": role_title, "source": source,
+    })
 
 
 def profile_form(existing: dict | None, form_key: str):
@@ -497,7 +646,13 @@ def profile_form(existing: dict | None, form_key: str):
     d = existing or {}
     with st.form(form_key, clear_on_submit=False):
         st.markdown("**Profile label** (just for you to tell profiles apart)")
-        label = st.text_input("Label", value=d.get("label", ""), placeholder="e.g. Jane – Backend roles")
+        lcol1, lcol2 = st.columns([3, 1])
+        label = lcol1.text_input("Label", value=d.get("label", ""), placeholder="e.g. Jane – Backend roles")
+        is_active = lcol2.checkbox(
+            "Active", value=d.get("is_active", True),
+            help="Only active profiles are used for sending — uncheck to pause a profile "
+                 "without deleting it.",
+        )
 
         st.markdown("**Contact & links**")
         c1, c2 = st.columns(2)
@@ -538,6 +693,40 @@ def profile_form(existing: dict | None, form_key: str):
         use_tls = st.checkbox("Use STARTTLS (587)", value=d.get("use_tls", True))
         cc_self = st.checkbox("CC myself on the email", value=d.get("cc_self", True))
 
+        st.markdown("**Subject line style**")
+        current_subject_template = d.get("subject_template", "")
+        matched_style = None
+        for style_name, tmpl in SUBJECT_STYLE_PRESETS.items():
+            if tmpl is not None and tmpl == current_subject_template:
+                matched_style = style_name
+                break
+        if not current_subject_template:
+            matched_style = "AI subject + name (default)"
+        elif matched_style is None:
+            matched_style = "Custom..."
+        style_options = list(SUBJECT_STYLE_PRESETS.keys())
+        subject_style = st.selectbox("Style", style_options, index=style_options.index(matched_style))
+        if subject_style == "Custom...":
+            st.caption("Placeholders: " + ", ".join(SUBJECT_PLACEHOLDERS))
+            custom_subject_template = st.text_input(
+                "Custom subject template",
+                value=current_subject_template if matched_style == "Custom..." else "",
+                placeholder="{ai_subject} - {full_name}",
+            )
+            resolved_subject_template = custom_subject_template
+        else:
+            resolved_subject_template = SUBJECT_STYLE_PRESETS[subject_style]
+
+        st.markdown("**Email template** (optional — this profile's own email format)")
+        st.caption(
+            "Leave blank to use the standard template (shown as the placeholder text below). "
+            "Available placeholders: " + ", ".join(TEMPLATE_PLACEHOLDERS)
+        )
+        email_template = st.text_area(
+            "Custom template", value=d.get("email_template", ""), height=220,
+            placeholder=DEFAULT_EMAIL_TEMPLATE,
+        )
+
         submitted = st.form_submit_button("💾 Save profile", type="primary", use_container_width=True)
 
         if submitted:
@@ -555,7 +744,7 @@ def profile_form(existing: dict | None, form_key: str):
                 st.error("Upload a resume for this profile.")
                 return None
             return {
-                "label": label, "full_name": full_name, "phone": phone,
+                "label": label, "is_active": is_active, "full_name": full_name, "phone": phone,
                 "contact_email": contact_email, "linkedin": linkedin, "github": github,
                 "current_location": current_location, "work_authorization": work_authorization,
                 "years_experience": years_experience, "availability": availability,
@@ -563,6 +752,7 @@ def profile_form(existing: dict | None, form_key: str):
                 "resume_bytes": resume_bytes, "resume_filename": resume_filename, "resume_text": resume_text,
                 "sender_email": sender_email, "sender_password": sender_password,
                 "smtp_server": smtp_server, "smtp_port": smtp_port, "use_tls": use_tls, "cc_self": cc_self,
+                "email_template": email_template, "subject_template": resolved_subject_template,
             }
     return None
 
@@ -576,11 +766,15 @@ with st.sidebar:
                "it only lives in this browser tab.")
 
     profile_ids = list(st.session_state.profiles.keys())
-    labels = ["➕ Add new profile"] + [st.session_state.profiles[pid]["label"] for pid in profile_ids]
+    labels = ["➕ Add new profile"] + [
+        st.session_state.profiles[pid]["label"] + ("" if st.session_state.profiles[pid].get("is_active", True) else " (inactive)")
+        for pid in profile_ids
+    ]
     default_index = 0
     if st.session_state.active_profile_id in profile_ids:
         default_index = profile_ids.index(st.session_state.active_profile_id) + 1
-    choice = st.selectbox("Active profile", labels, index=default_index)
+    choice = st.selectbox("Manage profile", labels, index=default_index,
+                           help="All profiles show here for editing, including inactive ones.")
 
     if choice == "➕ Add new profile":
         new_profile = profile_form(None, form_key="new_profile")
@@ -612,9 +806,11 @@ with st.sidebar:
     st.caption("One shared connection for everyone using this app — saves profiles for next time "
                "and logs every sent email (recruiter, company, JD, timestamp) for tracking.")
 
-    db = st.session_state.setdefault("db_config", {
-        "server": "", "port": 1433, "database": "", "username": "", "password": "",
-    })
+    if "db_config" not in st.session_state:
+        st.session_state["db_config"] = load_cached_db_config() or {
+            "server": "", "port": 1433, "database": "", "username": "", "password": "",
+        }
+    db = st.session_state["db_config"]
     db["server"] = st.text_input("Server / host", value=db["server"], placeholder="myserver.database.windows.net")
     dcol1, dcol2 = st.columns(2)
     db["port"] = dcol1.number_input("Port", value=int(db["port"]), step=1)
@@ -640,6 +836,15 @@ with st.sidebar:
                 st.success("Tables ready ✅")
             except Exception as e:
                 st.error(f"Failed: {e}")
+
+    if st.button("💾 Remember these settings on this computer", use_container_width=True,
+                 help="Saves server/port/database/username/password to a local file on this machine "
+                      "so you don't retype them next time you run the app here. Only works when "
+                      "running locally — doesn't apply on Streamlit Cloud."):
+        if save_cached_db_config(db):
+            st.success("Saved locally — will auto-fill next time you run the app on this machine ✅")
+        else:
+            st.error("Couldn't write the local settings file (check folder permissions).")
 
     ucol1, ucol2 = st.columns(2)
     with ucol1:
@@ -667,7 +872,7 @@ with st.sidebar:
                 st.error(f"Failed: {e}")
 
     st.session_state["db_log_enabled"] = st.checkbox(
-        "📝 Log every sent email to SQL Server", value=st.session_state.get("db_log_enabled", False),
+        "📝 Log every sent email to SQL Server", value=st.session_state.get("db_log_enabled", True),
     )
     st.caption("⚠️ API keys and SMTP passwords are stored in the `profiles` table as plain values on "
                "'Save profiles' — anyone with DB access can read them. Restrict DB access accordingly.")
@@ -681,10 +886,21 @@ if not st.session_state.profiles:
     st.info("👈 Add a profile in the sidebar to get started (contact info, resume, work auth, SMTP login).")
     st.stop()
 
-all_ids = list(st.session_state.profiles.keys())
+# Only active profiles are used for sending — inactive ones stay editable in the
+# sidebar but are hidden from every send-related list here in the main panel.
+all_ids = [pid for pid, p in st.session_state.profiles.items() if p.get("is_active", True)]
 all_labels = [st.session_state.profiles[pid]["label"] for pid in all_ids]
+inactive_count = len(st.session_state.profiles) - len(all_ids)
 
-tab_compose, tab_bulk, tab_log = st.tabs(["✉️ Compose & Send", "📦 Bulk Send", "📊 Tracking"])
+if not all_ids:
+    st.warning("All your profiles are marked inactive. Toggle at least one back to Active in the sidebar to send.")
+    st.stop()
+if inactive_count:
+    st.caption(f"ℹ️ {inactive_count} inactive profile(s) hidden from sending — toggle them back on in the sidebar.")
+
+tab_compose, tab_bulk, tab_cards, tab_log = st.tabs(
+    ["✉️ Compose & Send", "📦 Bulk Send", "📇 Recruiter Details", "📊 Tracking"]
+)
 
 with tab_compose:
     st.write("Paste a recruiter's job requirement below and pick which profiles it applies to. "
@@ -763,7 +979,13 @@ with tab_compose:
                     phone_candidates = extract_phone_candidates(job_description)
                     if phone_candidates and not st.session_state.recruiter_phone:
                         st.session_state.recruiter_phone = phone_candidates[0]
-                    st.success("Extracted — review the fields below before sending.")
+                    add_recruiter_card(
+                        company=st.session_state.recruiter_company, recruiter_name=st.session_state.recruiter_name,
+                        recruiter_email=st.session_state.recruiter_email, recruiter_phone=st.session_state.recruiter_phone,
+                        role_title=st.session_state.role_title, source="Compose",
+                    )
+                    st.success("Extracted — review the fields below before sending. Also saved to the "
+                               "📇 Recruiter Details tab.")
                 except Exception as e:
                     st.error(f"Extraction failed: {e}")
 
@@ -807,6 +1029,7 @@ with tab_compose:
                     )
                     full_body, bold_subject = assemble_email(
                         profile, narrative, subject, recruiter_name.strip() or "Hiring Team",
+                        role_title=role_title, recruiter_company=recruiter_company,
                     )
                     st.session_state[f"gen_subject_{pid}"] = bold_subject
                     st.session_state[f"gen_body_{pid}"] = full_body
@@ -838,6 +1061,11 @@ with tab_compose:
                         st.error("Enter the recruiter's email address above.")
                     elif not profile.get("sender_email") or not profile.get("sender_password"):
                         st.error(f"'{profile['label']}' is missing SMTP email/password — edit it in the sidebar.")
+                    elif not is_within_sending_window():
+                        st.warning(f"🕘 Outside sending hours (9:00 AM–5:00 PM CT) — this draft is saved. "
+                                   f"Come back after {next_window_open_str()} to send it.")
+                    elif has_already_sent(st.session_state.get("db_config", {}), profile["label"], recruiter_email, role_title):
+                        st.warning(f"⏭️ Already sent for '{role_title}' to {recruiter_email} from this profile — skipped to avoid a duplicate.")
                     else:
                         try:
                             send_email(
@@ -877,12 +1105,18 @@ with tab_compose:
         if send_all_clicked:
             if not recruiter_email:
                 st.error("Enter the recruiter's email address above.")
+            elif not is_within_sending_window():
+                st.warning(f"🕘 Outside sending hours (9:00 AM–5:00 PM CT) — these drafts are saved. "
+                           f"Come back after {next_window_open_str()} to send them.")
             else:
                 for pid in ready_ids:
                     profile = st.session_state.profiles[pid]
                     subj_key, body_key = f"gen_subject_{pid}", f"gen_body_{pid}"
                     if not profile.get("sender_email") or not profile.get("sender_password"):
                         st.error(f"Skipped '{profile['label']}': missing SMTP email/password.")
+                        continue
+                    if has_already_sent(st.session_state.get("db_config", {}), profile["label"], recruiter_email, role_title):
+                        st.warning(f"⏭️ '{profile['label']}': already sent for '{role_title}' to {recruiter_email} — skipped to avoid a duplicate.")
                         continue
                     try:
                         send_email(
@@ -922,55 +1156,81 @@ with tab_compose:
                "caching applies; for Claude it's marked with an explicit cache_control breakpoint.")
 
 with tab_bulk:
-    st.write("Paste **multiple** job requirements at once, separated by a line containing just `---`. "
-             "Each requirement gets its own recruiter/company/role extraction, and a personalized email "
-             "per selected profile. Sends go out one at a time with a delay between them, so a recruiter's "
-             "inbox (or your SMTP account) doesn't get hit with a burst all at once.")
+    st.write("Build a queue of job requirements — as soon as there's anything in it, the app "
+             "**automatically generates and sends** them one requirement at a time, with a varying "
+             "delay in between, so a run of applications doesn't look like a mass blast to recruiters. "
+             "No 'start' button — just add requirements and it takes it from there.")
 
-    bulk_text = st.text_area(
-        "Paste requirements here, separated by lines containing only ---", height=260,
-        placeholder="Looking for a Backend Engineer... jane@company.com\n\n---\n\n"
-                    "Looking for a Data Scientist... john@otherco.com\n\n---\n\n"
-                    "Looking for a DevOps Engineer... hr@thirdco.com",
+    st.subheader("Add to the queue")
+    st.session_state.setdefault("single_req_counter", 0)
+    single_req_text = st.text_area(
+        "Paste one job requirement", height=140, key=f"single_req_input_{st.session_state.single_req_counter}",
+        placeholder="Looking for a Backend Engineer with 5+ years... jane@company.com",
     )
+    add_one_col, _ = st.columns([1, 3])
+    with add_one_col:
+        if st.button("➕ Add to queue", use_container_width=True, disabled=not single_req_text.strip()):
+            st.session_state.bulk_requirements.append(single_req_text.strip())
+            st.session_state.single_req_counter += 1
+            st.rerun()
 
-    parse_col, _ = st.columns([1, 3])
-    with parse_col:
-        parse_clicked = st.button("📋 Parse requirements", use_container_width=True, disabled=not bulk_text.strip())
-
-    if parse_clicked:
-        parts = re.split(r"\n\s*-{3,}\s*\n", bulk_text.strip())
-        parts = [p.strip() for p in parts if p.strip()]
-        st.session_state.bulk_requirements = parts
-        st.session_state.bulk_queue = []  # parsing invalidates any previous queue
-        st.success(f"Found {len(parts)} requirement(s).")
+    with st.expander("Or paste several at once, separated by lines containing only ---"):
+        bulk_text = st.text_area(
+            "Paste requirements here, separated by ---", height=200,
+            placeholder="Looking for a Backend Engineer... jane@company.com\n\n---\n\n"
+                        "Looking for a Data Scientist... john@otherco.com",
+        )
+        if st.button("📋 Parse & add these", use_container_width=True, disabled=not bulk_text.strip()):
+            parts = re.split(r"\n\s*-{3,}\s*\n", bulk_text.strip())
+            parts = [p.strip() for p in parts if p.strip()]
+            st.session_state.bulk_requirements.extend(parts)
+            st.success(f"Added {len(parts)} requirement(s) to the queue.")
+            st.rerun()
 
     bulk_reqs = st.session_state.get("bulk_requirements", [])
     if bulk_reqs:
-        st.caption(f"📄 {len(bulk_reqs)} requirement(s) parsed:")
+        st.caption(f"📄 {len(bulk_reqs)} requirement(s) waiting in the queue:")
         for i, r in enumerate(bulk_reqs):
             st.caption(f"{i + 1}. {r[:100]}{'...' if len(r) > 100 else ''}")
+        if st.button("🗑️ Clear all requirements", key="clear_reqs_only"):
+            st.session_state.bulk_requirements = []
+            st.rerun()
 
         bulk_selected_labels = st.multiselect(
-            "Send for these profiles (applied to every requirement above)",
+            "Send for these profiles (applied to every requirement in the queue)",
             all_labels, default=all_labels, key="bulk_profile_select",
         )
         bulk_selected_ids = [all_ids[all_labels.index(lbl)] for lbl in bulk_selected_labels]
 
-        gen_bulk_col, _ = st.columns([1, 3])
-        with gen_bulk_col:
-            n_emails = len(bulk_reqs) * len(bulk_selected_ids)
-            generate_bulk_clicked = st.button(
-                f"✨ Generate {n_emails} email(s)", type="primary",
-                use_container_width=True, disabled=(n_emails == 0),
-            )
+        st.divider()
+        DELAY_CHOICES_SECONDS = [30, 60, 120]  # 30s, 1min, 2min — picked fresh before each gap
+        n_reqs = len(bulk_reqs)
+        n_emails = n_reqs * len(bulk_selected_ids)
+        st.caption(f"🔁 Processing automatically — {n_reqs} requirement(s), {n_emails} email(s) total. "
+                   "The gap between requirements varies each time (30s / 1min / 2min), so sends don't "
+                   "land at a predictable, machine-like cadence. Keep this tab open until it finishes.")
 
-        if generate_bulk_clicked:
+        if bulk_selected_ids and not is_within_sending_window():
+            st.info(f"🕘 Outside sending hours (9:00 AM–5:00 PM CT). {n_reqs} requirement(s) stay queued — "
+                    f"they'll process automatically next time this app is open after {next_window_open_str()}.")
+        elif bulk_selected_ids:
+            reqs_to_process = list(st.session_state.bulk_requirements)
             helper_profile = st.session_state.profiles[bulk_selected_ids[0]]
-            queue = []
-            progress = st.progress(0.0)
-            for ri, req_text in enumerate(bulk_reqs):
-                progress.progress(ri / len(bulk_reqs), text=f"Processing requirement {ri + 1}/{len(bulk_reqs)}...")
+            total_reqs = len(reqs_to_process)
+            overall_progress = st.progress(0.0)
+            status_placeholder = st.empty()
+            stopped_early = False
+
+            for ri, req_text in enumerate(reqs_to_process):
+                if not is_within_sending_window():
+                    status_placeholder.info(
+                        f"🕘 Sending window closed (9:00 AM–5:00 PM CT). {total_reqs - ri} requirement(s) "
+                        f"remain queued — they'll resume automatically after {next_window_open_str()}."
+                    )
+                    stopped_early = True
+                    break
+
+                status_placeholder.info(f"⚙️ Generating requirement {ri + 1}/{total_reqs}...")
 
                 found_emails = sorted(set(re.findall(EMAIL_REGEX, req_text)))
                 req_recruiter_email = found_emails[0] if found_emails else ""
@@ -986,17 +1246,26 @@ with tab_bulk:
                     except Exception as e:
                         st.warning(f"Requirement {ri + 1}: extraction failed ({e}) — company/name/role left blank.")
 
+                add_recruiter_card(
+                    company=fields["company"], recruiter_name=fields["recruiter_name"],
+                    recruiter_email=req_recruiter_email, recruiter_phone=req_recruiter_phone,
+                    role_title=fields["role_title"], source=f"Auto-process #{ri + 1}",
+                )
+
+                status_placeholder.info(f"📤 Sending requirement {ri + 1}/{total_reqs}...")
                 for pid in bulk_selected_ids:
                     profile = st.session_state.profiles[pid]
                     if not profile.get("api_key"):
-                        queue.append({
-                            "req_index": ri, "req_preview": req_text[:100], "job_description": req_text,
-                            "profile_id": pid, "profile_label": profile["label"],
-                            "recruiter_email": req_recruiter_email, "recruiter_company": fields["company"],
-                            "recruiter_name": fields["recruiter_name"], "recruiter_phone": req_recruiter_phone,
-                            "role_title": fields["role_title"], "subject": "", "body": "",
-                            "status": "failed", "error": f"No {profile['provider']} API key saved.",
-                        })
+                        st.error(f"❌ {profile['label']}: no {profile['provider']} API key saved — skipped.")
+                        continue
+                    if not req_recruiter_email:
+                        st.error(f"❌ {profile['label']}: no recruiter email detected in this requirement — "
+                                 "skipped (check the 📇 Recruiter Details tab and send manually if needed).")
+                        continue
+                    if has_already_sent(st.session_state.get("db_config", {}), profile["label"],
+                                        req_recruiter_email, fields["role_title"]):
+                        st.warning(f"⏭️ {profile['label']}: already sent for '{fields['role_title']}' to "
+                                   f"{req_recruiter_email} — skipped to avoid a duplicate.")
                         continue
                     try:
                         subject, narrative = generate_email(
@@ -1004,153 +1273,82 @@ with tab_bulk:
                         )
                         full_body, bold_subject = assemble_email(
                             profile, narrative, subject, fields["recruiter_name"] or "Hiring Team",
+                            role_title=fields["role_title"], recruiter_company=fields["company"],
                         )
-                        queue.append({
-                            "req_index": ri, "req_preview": req_text[:100], "job_description": req_text,
-                            "profile_id": pid, "profile_label": profile["label"],
-                            "recruiter_email": req_recruiter_email, "recruiter_company": fields["company"],
-                            "recruiter_name": fields["recruiter_name"], "recruiter_phone": req_recruiter_phone,
-                            "role_title": fields["role_title"], "subject": bold_subject, "body": full_body,
-                            "status": "ready", "error": None,
-                        })
+                        send_email(
+                            profile["smtp_server"], int(profile["smtp_port"]),
+                            profile["sender_email"], profile["sender_password"],
+                            profile["use_tls"], req_recruiter_email, profile["cc_self"],
+                            bold_subject, full_body,
+                            profile["resume_bytes"], profile["resume_filename"],
+                        )
+                        st.success(f"✅ Requirement {ri + 1}: {profile['label']} → {req_recruiter_email}")
+                        if st.session_state.get("db_log_enabled"):
+                            try:
+                                log_email_attempt(
+                                    st.session_state["db_config"], profile, req_recruiter_email,
+                                    fields["company"], fields["recruiter_name"], req_recruiter_phone,
+                                    fields["role_title"], bold_subject, req_text, "sent",
+                                )
+                            except Exception as e:
+                                st.warning(f"Sent, but logging failed: {e}")
                     except Exception as e:
-                        queue.append({
-                            "req_index": ri, "req_preview": req_text[:100], "job_description": req_text,
-                            "profile_id": pid, "profile_label": profile["label"],
-                            "recruiter_email": req_recruiter_email, "recruiter_company": fields["company"],
-                            "recruiter_name": fields["recruiter_name"], "recruiter_phone": req_recruiter_phone,
-                            "role_title": fields["role_title"], "subject": "", "body": "",
-                            "status": "failed", "error": str(e),
-                        })
-            progress.progress(1.0, text="Done.")
-            st.session_state.bulk_queue = queue
+                        st.error(f"❌ Requirement {ri + 1}: {profile['label']} → {req_recruiter_email}: {e}")
+                        if st.session_state.get("db_log_enabled"):
+                            try:
+                                log_email_attempt(
+                                    st.session_state["db_config"], profile, req_recruiter_email,
+                                    fields["company"], fields["recruiter_name"], req_recruiter_phone,
+                                    fields["role_title"], "", req_text, "failed", str(e),
+                                )
+                            except Exception:
+                                pass
 
-    bulk_queue = st.session_state.get("bulk_queue", [])
-    if bulk_queue:
-        st.divider()
-        ready_count = sum(1 for it in bulk_queue if it["status"] == "ready")
-        sent_count = sum(1 for it in bulk_queue if it["status"] == "sent")
-        failed_count = sum(1 for it in bulk_queue if it["status"] == "failed")
-        st.subheader(f"Queue — {ready_count} ready, {sent_count} sent, {failed_count} failed")
+                if req_text in st.session_state.bulk_requirements:
+                    st.session_state.bulk_requirements.remove(req_text)
 
-        req_indices = sorted(set(it["req_index"] for it in bulk_queue))
-        for ri in req_indices:
-            items = [it for it in bulk_queue if it["req_index"] == ri]
-            with st.expander(f"📄 Requirement {ri + 1}: {items[0]['req_preview']}...", expanded=False):
-                for item in items:
-                    key_base = f"bulk_{ri}_{item['profile_id']}"
-                    icon = {"ready": "⬜", "sent": "✅", "failed": "❌"}.get(item["status"], "⬜")
-                    st.markdown(f"**{icon} {item['profile_label']}**")
-                    if item["status"] == "failed":
-                        st.caption(f"Error: {item.get('error', '')}")
-                    else:
-                        rcol1, rcol2 = st.columns(2)
-                        with rcol1:
-                            item["recruiter_email"] = st.text_input(
-                                "Recruiter email", value=item["recruiter_email"], key=f"{key_base}_email",
-                            )
-                            item["recruiter_company"] = st.text_input(
-                                "Recruiter's company", value=item.get("recruiter_company", ""), key=f"{key_base}_company",
-                            )
-                        with rcol2:
-                            item["recruiter_phone"] = st.text_input(
-                                "Recruiter phone", value=item.get("recruiter_phone", ""), key=f"{key_base}_phone",
-                            )
-                            item["role_title"] = st.text_input(
-                                "Role / job title", value=item.get("role_title", ""), key=f"{key_base}_role",
-                            )
-                        st.caption("📋 Copy:")
-                        st.code(
-                            f"Role: {item['role_title']}\nEmail: {item['recruiter_email']}\nPhone: {item['recruiter_phone']}",
-                            language=None,
-                        )
-                        item["subject"] = st.text_input("Subject", value=item["subject"], key=f"{key_base}_subj")
-                        item["body"] = st.text_area("Body", value=item["body"], height=180, key=f"{key_base}_body")
-                    st.divider()
+                overall_progress.progress((ri + 1) / total_reqs)
 
-        st.subheader("Send the queue")
-        delay_choice = st.radio(
-            "Delay between each send", ["Immediate", "1 minute", "3 minutes"], horizontal=True,
-            help="Applied between every individual email sent, so a burst of sends doesn't hit "
-                 "recruiters' inboxes (or trip spam filters on your SMTP account) all at once.",
-        )
-        delay_seconds = {"Immediate": 0, "1 minute": 60, "3 minutes": 180}[delay_choice]
-        pending = [it for it in bulk_queue if it["status"] == "ready"]
-        if pending and delay_seconds:
-            est_minutes = (len(pending) - 1) * delay_seconds / 60
-            st.caption(f"⏱️ Estimated total time: ~{est_minutes:.0f} min for {len(pending)} pending email(s). "
-                       "Keep this tab open while it runs.")
-
-        send_bulk_col, clear_col = st.columns([1, 1])
-        with send_bulk_col:
-            start_sending_clicked = st.button(
-                f"🚀 Send {len(pending)} pending", type="primary",
-                use_container_width=True, disabled=(len(pending) == 0),
-            )
-        with clear_col:
-            if st.button("🗑️ Clear queue", use_container_width=True):
-                st.session_state.bulk_queue = []
-                st.session_state.bulk_requirements = []
-                st.rerun()
-
-        if start_sending_clicked:
-            overall_progress = st.progress(0.0)
-            status_placeholder = st.empty()
-            total = len(pending)
-            for i, item in enumerate(pending):
-                if not item["recruiter_email"]:
-                    item["status"] = "failed"
-                    item["error"] = "No recruiter email set."
-                    st.error(f"❌ {i + 1}/{total}: {item['profile_label']} — no recruiter email set, skipped.")
-                    overall_progress.progress((i + 1) / total)
-                    continue
-
-                profile = st.session_state.profiles[item["profile_id"]]
-                status_placeholder.info(f"📤 Sending {i + 1}/{total}: {item['profile_label']} → {item['recruiter_email']}...")
-                try:
-                    send_email(
-                        profile["smtp_server"], int(profile["smtp_port"]),
-                        profile["sender_email"], profile["sender_password"],
-                        profile["use_tls"], item["recruiter_email"], profile["cc_self"],
-                        item["subject"], item["body"],
-                        profile["resume_bytes"], profile["resume_filename"],
-                    )
-                    item["status"] = "sent"
-                    st.success(f"✅ Sent {i + 1}/{total}: {item['profile_label']} → {item['recruiter_email']}")
-                    if st.session_state.get("db_log_enabled"):
-                        try:
-                            log_email_attempt(
-                                st.session_state["db_config"], profile, item["recruiter_email"],
-                                item["recruiter_company"], item["recruiter_name"], item["recruiter_phone"],
-                                item["role_title"], item["subject"], item["job_description"], "sent",
-                            )
-                        except Exception as e:
-                            st.warning(f"Sent, but logging failed: {e}")
-                except Exception as e:
-                    item["status"] = "failed"
-                    item["error"] = str(e)
-                    st.error(f"❌ Failed {i + 1}/{total}: {item['profile_label']} → {item['recruiter_email']}: {e}")
-                    if st.session_state.get("db_log_enabled"):
-                        try:
-                            log_email_attempt(
-                                st.session_state["db_config"], profile, item["recruiter_email"],
-                                item["recruiter_company"], item["recruiter_name"], item["recruiter_phone"],
-                                item["role_title"], item["subject"], item["job_description"], "failed", str(e),
-                            )
-                        except Exception:
-                            pass
-
-                overall_progress.progress((i + 1) / total)
-
-                if delay_seconds and i < total - 1:
+                if ri < total_reqs - 1:
+                    delay_seconds = random.choice(DELAY_CHOICES_SECONDS)
                     remaining = delay_seconds
                     while remaining > 0:
                         mins, secs = divmod(remaining, 60)
-                        status_placeholder.info(f"⏳ Waiting {mins}m {secs:02d}s before next send ({i + 2}/{total})...")
+                        status_placeholder.info(
+                            f"⏳ Waiting {mins}m {secs:02d}s before requirement {ri + 2}/{total_reqs}..."
+                        )
                         time.sleep(1)
                         remaining -= 1
 
-            status_placeholder.success("🎉 Bulk send complete.")
+            if not stopped_early:
+                status_placeholder.success("🎉 Queue processed.")
+                st.rerun()
+
+with tab_cards:
+    st.write("Every recruiter/company/role extraction — from Compose or Bulk Send — lands here as a card, "
+             "so you can find and copy details later even if you missed copying them at the time.")
+    cards = st.session_state.get("recruiter_cards", [])
+    if not cards:
+        st.info("Nothing extracted yet. Cards show up here after you use "
+                 "'🔍 Extract recruiter, company & role details' or generate a Bulk Send queue.")
+    else:
+        if st.button("🗑️ Clear all cards"):
+            st.session_state.recruiter_cards = []
+            st.rerun()
+        for i, card in enumerate(cards):
+            with st.container(border=True):
+                title_bits = [b for b in [card["role_title"], card["company"]] if b]
+                st.markdown(f"**{' at '.join(title_bits) if title_bits else 'Recruiter details'}**"
+                            f"  ·  _{card['source']}_")
+                if card["recruiter_name"]:
+                    st.caption(f"Contact: {card['recruiter_name']}")
+                st.code(
+                    f"Role: {card['role_title']}\n"
+                    f"Company: {card['company']}\n"
+                    f"Email: {card['recruiter_email']}\n"
+                    f"Phone: {card['recruiter_phone']}",
+                    language=None,
+                )
 
 with tab_log:
     st.subheader("🗄️ Database browser")
