@@ -169,7 +169,7 @@ applying for the role described below, using the candidate profile and resume ab
 Reference only real resume content — never invent skills, achievements, or numbers not in the resume.
 Wrap 3-5 genuinely essential keywords/skills in **double asterisks** for emphasis (e.g. **AWS**, **Python**).
 
-The email already opens with "Dear <Recruiter>,\\n\\nI hope this message finds you well. " before
+The email already opens with "Hello/Hi <Recruiter>,\\n\\nI hope this message finds you well. " before
 your text, so your FIRST sentence must continue naturally straight after "well." — start it with
 something like "I am writing to express my interest in the <role> position at <company>..." if a
 role/company name is identifiable in the job requirement below, otherwise phrase the opening
@@ -1044,8 +1044,25 @@ with tab_bulk:
                     if item["status"] == "failed":
                         st.caption(f"Error: {item.get('error', '')}")
                     else:
-                        item["recruiter_email"] = st.text_input(
-                            "Recruiter email", value=item["recruiter_email"], key=f"{key_base}_email",
+                        rcol1, rcol2 = st.columns(2)
+                        with rcol1:
+                            item["recruiter_email"] = st.text_input(
+                                "Recruiter email", value=item["recruiter_email"], key=f"{key_base}_email",
+                            )
+                            item["recruiter_company"] = st.text_input(
+                                "Recruiter's company", value=item.get("recruiter_company", ""), key=f"{key_base}_company",
+                            )
+                        with rcol2:
+                            item["recruiter_phone"] = st.text_input(
+                                "Recruiter phone", value=item.get("recruiter_phone", ""), key=f"{key_base}_phone",
+                            )
+                            item["role_title"] = st.text_input(
+                                "Role / job title", value=item.get("role_title", ""), key=f"{key_base}_role",
+                            )
+                        st.caption("📋 Copy:")
+                        st.code(
+                            f"Role: {item['role_title']}\nEmail: {item['recruiter_email']}\nPhone: {item['recruiter_phone']}",
+                            language=None,
                         )
                         item["subject"] = st.text_input("Subject", value=item["subject"], key=f"{key_base}_subj")
                         item["body"] = st.text_area("Body", value=item["body"], height=180, key=f"{key_base}_body")
