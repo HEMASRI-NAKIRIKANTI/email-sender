@@ -462,6 +462,14 @@ def ensure_tables(conn):
         job_description NVARCHAR(MAX), status NVARCHAR(20), error_message NVARCHAR(1000)
     )
     """)
+    cur.execute("""
+    IF OBJECT_ID('dbo.requirement_queue', 'U') IS NULL
+    CREATE TABLE dbo.requirement_queue (
+        queue_id INT IDENTITY(1,1) PRIMARY KEY,
+        requirement_text NVARCHAR(MAX),
+        added_at DATETIME DEFAULT GETDATE()
+    )
+    """)
     # Migrations: adds columns to a dbo.profiles table created before these
     # features existed. No-op on a freshly created table (columns already there).
     cur.execute("""
@@ -596,6 +604,61 @@ def has_already_sent(db: dict, profile_label: str, recruiter_email: str, role_ti
 
 
 # --------------------------------------------------------------------------
+# Persistent requirement queue — survives closing the app entirely (not just
+# staying open overnight). Each queue item lives here until it's actually
+# been through the send pipeline (sent or failed), at which point it's
+# deleted. Best-effort: if SQL Server isn't configured or a call fails, the
+# app falls back to session-only queue behavior rather than blocking.
+# --------------------------------------------------------------------------
+
+def save_requirement_to_db(db: dict, text: str):
+    """Inserts a queued requirement and returns its new queue_id, or None on failure."""
+    if not db.get("server"):
+        return None
+    try:
+        conn = get_db_connection(db)
+        ensure_tables(conn)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO dbo.requirement_queue (requirement_text) VALUES (%s)", (text,))
+        conn.commit()
+        cur.execute("SELECT SCOPE_IDENTITY()")
+        new_id = cur.fetchone()[0]
+        conn.close()
+        return int(new_id) if new_id is not None else None
+    except Exception:
+        return None
+
+
+def load_requirements_from_db(db: dict) -> list:
+    """Returns [{'queue_id': int, 'text': str}, ...] ordered oldest-first."""
+    if not db.get("server"):
+        return []
+    try:
+        conn = get_db_connection(db)
+        ensure_tables(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT queue_id, requirement_text FROM dbo.requirement_queue ORDER BY added_at ASC")
+        rows = cur.fetchall()
+        conn.close()
+        return [{"queue_id": r[0], "text": r[1]} for r in rows]
+    except Exception:
+        return []
+
+
+def delete_requirement_from_db(db: dict, queue_id):
+    if not db.get("server") or queue_id is None:
+        return
+    try:
+        conn = get_db_connection(db)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM dbo.requirement_queue WHERE queue_id = %s", (queue_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # best-effort — if this fails, the item just gets picked up again next sync
+
+
+# --------------------------------------------------------------------------
 # Local DB-config cache — only useful when running the app on your own
 # machine (Streamlit Cloud's filesystem is ephemeral and wiped on redeploy,
 # and would be shared across every visitor, which we don't want). Saves you
@@ -626,7 +689,7 @@ def save_cached_db_config(db: dict) -> bool:
 # --------------------------------------------------------------------------
 st.session_state.setdefault("profiles", {})       # id -> profile dict
 st.session_state.setdefault("active_profile_id", None)
-st.session_state.setdefault("bulk_requirements", [])   # list of requirement text strings, drained as processed
+st.session_state.setdefault("bulk_requirements", [])   # list of {"queue_id": int|None, "text": str}, drained as processed
 st.session_state.setdefault("recruiter_cards", [])       # persistent copy-cards, newest first
 # Per-profile generated drafts are stored dynamically as gen_subject_<id> / gen_body_<id>
 
@@ -1161,6 +1224,19 @@ with tab_bulk:
              "delay in between, so a run of applications doesn't look like a mass blast to recruiters. "
              "No 'start' button — just add requirements and it takes it from there.")
 
+    # One-time sync per session: pull in anything still pending in SQL Server from
+    # a previous close/reopen (queue items only live here otherwise get lost).
+    if "bulk_queue_synced" not in st.session_state:
+        st.session_state.bulk_queue_synced = True
+        db_cfg = st.session_state.get("db_config", {})
+        if db_cfg.get("server"):
+            db_items = load_requirements_from_db(db_cfg)
+            existing_ids = {item.get("queue_id") for item in st.session_state.bulk_requirements}
+            recovered = [item for item in db_items if item["queue_id"] not in existing_ids]
+            if recovered:
+                st.session_state.bulk_requirements.extend(recovered)
+                st.info(f"📥 Recovered {len(recovered)} requirement(s) still pending from a previous session.")
+
     st.subheader("Add to the queue")
     st.session_state.setdefault("single_req_counter", 0)
     single_req_text = st.text_area(
@@ -1170,7 +1246,9 @@ with tab_bulk:
     add_one_col, _ = st.columns([1, 3])
     with add_one_col:
         if st.button("➕ Add to queue", use_container_width=True, disabled=not single_req_text.strip()):
-            st.session_state.bulk_requirements.append(single_req_text.strip())
+            text = single_req_text.strip()
+            queue_id = save_requirement_to_db(st.session_state.get("db_config", {}), text)
+            st.session_state.bulk_requirements.append({"queue_id": queue_id, "text": text})
             st.session_state.single_req_counter += 1
             st.rerun()
 
@@ -1183,16 +1261,24 @@ with tab_bulk:
         if st.button("📋 Parse & add these", use_container_width=True, disabled=not bulk_text.strip()):
             parts = re.split(r"\n\s*-{3,}\s*\n", bulk_text.strip())
             parts = [p.strip() for p in parts if p.strip()]
-            st.session_state.bulk_requirements.extend(parts)
+            db_cfg = st.session_state.get("db_config", {})
+            for p in parts:
+                queue_id = save_requirement_to_db(db_cfg, p)
+                st.session_state.bulk_requirements.append({"queue_id": queue_id, "text": p})
             st.success(f"Added {len(parts)} requirement(s) to the queue.")
             st.rerun()
 
     bulk_reqs = st.session_state.get("bulk_requirements", [])
     if bulk_reqs:
-        st.caption(f"📄 {len(bulk_reqs)} requirement(s) waiting in the queue:")
-        for i, r in enumerate(bulk_reqs):
-            st.caption(f"{i + 1}. {r[:100]}{'...' if len(r) > 100 else ''}")
+        st.caption(f"📄 {len(bulk_reqs)} requirement(s) waiting in the queue "
+                   f"({'saved to SQL Server, survives closing the app' if st.session_state.get('db_config', {}).get('server') else 'session-only — connect SQL Server to survive a full close'}):")
+        for i, item in enumerate(bulk_reqs):
+            t = item["text"]
+            st.caption(f"{i + 1}. {t[:100]}{'...' if len(t) > 100 else ''}")
         if st.button("🗑️ Clear all requirements", key="clear_reqs_only"):
+            db_cfg = st.session_state.get("db_config", {})
+            for item in st.session_state.bulk_requirements:
+                delete_requirement_from_db(db_cfg, item.get("queue_id"))
             st.session_state.bulk_requirements = []
             st.rerun()
 
@@ -1221,7 +1307,9 @@ with tab_bulk:
             status_placeholder = st.empty()
             stopped_early = False
 
-            for ri, req_text in enumerate(reqs_to_process):
+            for ri, req_item in enumerate(reqs_to_process):
+                req_text = req_item["text"]
+
                 if not is_within_sending_window():
                     status_placeholder.info(
                         f"🕘 Sending window closed (9:00 AM–5:00 PM CT). {total_reqs - ri} requirement(s) "
@@ -1304,8 +1392,10 @@ with tab_bulk:
                             except Exception:
                                 pass
 
-                if req_text in st.session_state.bulk_requirements:
-                    st.session_state.bulk_requirements.remove(req_text)
+                st.session_state.bulk_requirements = [
+                    it for it in st.session_state.bulk_requirements if it is not req_item
+                ]
+                delete_requirement_from_db(st.session_state.get("db_config", {}), req_item.get("queue_id"))
 
                 overall_progress.progress((ri + 1) / total_reqs)
 
